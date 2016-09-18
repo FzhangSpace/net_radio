@@ -1,0 +1,337 @@
+﻿# 数字媒体广播系统(网络收音机)
+
+标签（空格分隔）： project
+
+---
+链接：http://pan.baidu.com/s/1gd6U6pd 密码：fhd5
+##**(一) 概要**
+    
+    实现的功能,广播流媒体文件,发送端和接收端,发送端分为200个频道,其中有一个菜单频道,和其他的数据频道,接收端通过客户端通过菜单选择数据频道,并且通过mpg123播放
+    
+##**(二)模块划分**
+
+###**发送端**
+    
+    菜单发送模块:
+        负责发送菜单,包括频道号,以及该频道相应的描述,以供接收端选择频道
+        
+    媒体数据发送模块:
+        负责发送各个频道的媒体数据
+    
+    媒体资源处理模块:
+        负责从媒体目录中相应文件里面读取媒体数据提交给媒体数据发送模块
+        
+    令牌桶:
+        负责控制发送数据的速度,以确保不会因为发送的速度过快导致接收端缓冲区满溢出而丢包
+    
+    发送和接收时的数据结构
+    
+    程序的主体
+        
+##**(三)实现细节**
+###**3.0 发送和接收时的数据包结构**
+
+    ./src/include/proto.h
+    ./src/include/site_types.h
+
+```
+#defien CHNNR   200 /* 频道个数 */
+
+#define LISTCHNID       0   /* 节目单的频道号 */
+#define MINCHNID        1   /* 最小频道号 */
+#define MAXCHNID        (MINCHNID+CHNNR-1)  /* 最大频道号 */
+
+#define MSG_CHANNEL_MAX    (65536-20-8) /* 一个最大的字节数 */
+typedef uint8_t chnid_t;    /* 频道号 */
+
+/* 数据频道发送的包结构 */
+struct msg_channel_st {
+    chnid_t     id; /* MUST BETWEEN [MINCHIND, MAXCHIND] 频道号 */
+    uint8_t     data[1];    /* 流媒体数据, 当做可边长类型使用 */    
+} __attribute__((packed));  
+/* 不进行结构体内存对齐,避免网络通信中,双方对齐方式不一样 */
+
+#define MSG_LIST_MAX    (65536-20-8)    
+struct msg_listentry_st {   /* 每个频道的频道号以及对应的频道描述 */
+    chnid_t     id; /* MUST BETWEEN [MINCHIND, MAXCHIND] 频道号 */
+    uint16_t    len;    /* 保存当前这个包的大小,以便得到下一个包的地址 */
+    uint8_t     desrc[1];   /* 频道描述, 当做可变长字节数组 */
+} __attribute__((packed));
+
+/* 菜单 */
+struct msg_list_st {    /* 菜单频道的包结构 */
+    chnid_t     id; /* MUST BE LISTCHNID  频道号 */     
+    struct msg_listentry_st entry[1];   /* 各个频道的频道号以及频道信息,  当做可变长字节数组 */
+} __attribute__((packed));
+
+```
+
+####**新遇到的函数或用法**
+
+    不要任意直接使用常量,如果这个常量有意义,那就定义宏来使用,便于后期的维护和代码的可读性
+    在两台电脑上通过网络传输数据的时候,不仅要注意大小端的问题,还要注意两台电脑之间的内存对齐问题
+
+```
+struct list {
+    struct list *next;
+    char data[0];
+};
+在32位下,sizeof(struct list)是4个字节,data里面没有元素,所以是0个字节,但是data的地址是紧贴着struct list末尾的地址的,所以可以这样使用
+struct list *ptr = malloc(sizeof(struct list)+20);
+这个结构体指针指向的空间多出20个字节来,可以通过data来得到这块内存的首地址,这样就实现了一个类似一个可变长字节的结构体
+```
+    
+
+###**3.1 令牌桶**
+    ./src/server/mytbf.h     
+    ./src/server/mytbf.c 
+    
+    大体的功能是有一个容器,存有多个令牌,当去读文件的时候先去令牌桶拿令牌,拿到多少个就读出多少个字节, 规定令牌桶的最大容量(burst),每秒钟能拿多少个令牌(字节)(cps),当前桶内剩余的令牌数(token);
+    桶内的令牌会自动增长,每秒增长cps个令牌
+
+```
+/* 主要的数据结构 */
+    struct mytbf_st {
+        int cps;    /* 每秒多少字节 */
+        int burst;  /* 桶的容量 字节数*/
+        int token;  /* 当前桶的大小 字节数*/
+        pthread_mutex_t mut; /* 对token进行加锁 */
+        pthread_cond_t  cond;   /*如果取得时候,令牌桶里面没有令牌,就会阻塞在这个条件变量上*/
+    };
+```
+```
+tpyedef void mytbf_t;   //令牌桶的处理句柄
+
+static struct mytbf_st *tbf[TBFMAX];    /* 令牌桶指针数组 */
+static pthread_mutex_t mut_tbf = PTHREAD_MUTEX_INITIALIZER; 用于锁这个令牌桶数组
+static pthread_t tid_timer;
+static pthread_once_t init_once = PTHREAD_ONCE_INIT;
+
+mytbf_t *mytbf_init(int cps, int burst); //初始化化令牌桶,设置这个令牌桶的cps和burst
+    static void module_load(void);  //加载时钟线程,
+        static void *thr_timer_func(void *unused);   //这个线程主要同于令牌桶中令牌的自增
+        static void *module_unload(void);   //销毁和回收时钟线程,使用的是atexit调用的,当进程结束时运行
+    static int get_free_pos();  //从令牌桶数组中得带没有使用的令牌桶下标
+    返回令牌桶的地址,当做句柄
+
+int mytbf_fetchtoken(mytbf_t *,int n); //从桶里面取令牌,如果有就取走,没有就阻塞在条件变量上等待
+
+int mytbf_returntoken(mytbf_t *, int n); //如果取得令牌没有用完,就把剩余的还回去
+
+int mytbf_destroy(mytbf_t *); //销毁令牌桶
+    
+```
+
+    令牌桶指针数组的存在是为了令牌桶自增方便,把所有的令牌桶统计一下,通过一个线程轮询的方式自增,就避免每个令牌桶都使用单独的自增线程,节省资源,便于管理.
+    当然,这显然是一个需要多个线程同时操作的变量,所以需要加锁
+    
+####**新遇到的函数或用法**
+```
+    //睡眠一秒
+    struct timespec t;
+    t.tv_sec = 1;   //m
+    t.tv_nsec = 0;  //ns
+    
+    /* 第一个参数是要睡多少秒,第二个参数是如果睡眠被信号打断,剩余的时间 ,放到循环里,知道1s全部执行完,当跳出循环*/
+    while (nanosleep(&t, &t) != 0) {    
+        if (errno != EINTR) {
+            syslog(LOG_ERR, "nanosleep(): %s", strerror(errno));
+            exit(1);
+        }   
+    }   
+    
+    //设置程序进程结束时调用的函数(返回值void,没有参数)
+    int atexit(void (*function)(void));
+
+    //在线程函数中,只执行一次这个函数(返回值void,没有参数)
+    pthread_once_t once_control = PTHREAD_ONCE_INIT;
+    int pthread_once(pthread_once_t *once_control,
+              void (*init_routine)(void));
+```    
+
+###**3.2 媒体资源处理模块**
+    ./src/server/medialib.c  
+    ./src/server/medialib.h
+    媒体文件的存储方式是在./tmp/media文件中,一个单独的文件,里面有存储着.MP3流媒体文件和desc.test文件(缺一不可),我们根据满足要求的子文件的个数来确定频道的个数,频道数新定位200个
+
+```
+    /* 主要的数据结构 */
+struct mlib_listentry_st {      /* 每个频道的描述的结构体 */
+    chnid_t   id;       //频道id
+    char    *desc;      //频道的描述,也就是desc.test中的内容
+};
+
+struct channel_context_st { /* 存储频道的内容信息*/
+    chnid_t     id;     //频道id
+    char        *desc;  //频道描述
+    glob_t      mp3glob;    //在频道子目录中符合相应规则("*.mp3")的文件名的集合
+    int         pos;    //当前读取的文件名在mp3glob这个文件名的下标
+    off_t       offset;     //读取当前文件的指针偏移
+    int         fd;     //当前文件的文件描述符
+    mytbf_t     *tbf;   //读这个文件的令牌桶句柄
+};
+
+```
+
+```
+/***************API**********/
+
+static struct channel_context_st channel[MAXCHNID+1];   //存储所有的频道内容信息的数组
+
+
+/* 通过媒体资源目录,得到当前的频道列表信息和频道个数 */
+int mlib_getchnlist(struct mlib_listentry_st **, int *);    
+    static struct channel_context_st *path2entry(const char *path)  //把频道媒体数据的子目录路径传进去,返回一个当前频道内容信息的结构体指针
+        mytbf_t *mytbf_init(int cps, int burst);    //初始化这个频道的令牌桶
+        
+//根据频道号找到相对应的资源文件,读到buf里,返回读取到的字节数
+ssize_t mlib_readchn(chnid_t cid, void* buf, ssize_t len);  
+    int mytbf_fetchtoken(mytbf_t *,int n); //从桶里面取令牌,确定可以读取的字节数
+    static int open_next(chnid_t id);   //如果read返回值是0,说明已经读完,自动读取下一个文件
+    int mytbf_returntoken(mytbf_t *, int n); //读取内容成功,如果又没用完的令牌,就还回去
+    
+int mlib_freechnlist(struct mlib_listentry_st *);   //释放channel数组资源
+```
+
+
+    函数的实现细节
+    
+    `int mlib_getchnlist(struct mlib_listentry_st **result, int *resnum)`
+        通过`snprintf(path, PATHSIZE, "%s/*", server_conf.media_dir)`;这一步拼接出"/var/media/*"带有通配符字符串,`server_conf.media_dir`这个就是默认的资源路径("/var/media")(绝对路径)
+        
+        再使用`glob(path, 0, NULL, &globres)`得到符合这个通配符的所有文件名信息,放到`globres`里面
+        
+        再根据`globres.gl_pathc`符合条件的文件路径个数确定一共需要创建的频道个数,在malloc内存相应的菜单项内存
+        
+        通过轮询`globres.gl_pathv[i]`,范围`globres.gl_pathc`,来遍历每个频道的媒体文件,
+            再通过`res = path2entry(globres.gl_pathv[i]);`获取每个频道的内容(id,描述,流媒体文件等),
+            然后把path2entry返回的内容转化成`mlib_listentry_st`,都放到一个数组中
+        然后把频道的菜单列表和菜单的大小传出去.
+        
+        
+    `ssize_t mlib_readchn(chnid_t cid, void* buf, ssize_t len);` 读取媒体数据
+        `tbfsize = mytbf_fetchtoken(channel[id].tbf, size);`首先从;令牌桶获取令牌
+        `len = pread(channel[id].fd, buf, tbfsize, channel[id].offset);` 从offset的偏移位置读取数据
+        `mytbf_returntoken(channel[id].tbf, tbfsize-len);`把剩余的令牌换回去
+   
+####**新遇到的函数或用法**
+
+```
+#include <glob.h>
+int glob(const char *pattern, int flags,
+         int (*errfunc) (const char *epath, int eerrno),
+         glob_t *pglob);
+         
+typedef struct {
+    size_t   gl_pathc;    /*gl_pathv里面有多少个符合规则的文件名  Count of paths matched so far  */
+    char   **gl_pathv;    /* 字符串的内容 List of matched pathnames.  */
+    size_t   gl_offs;     /* Slots to reserve in `gl_pathv'. 为GLOB_DOOFS保留的 */
+} glob_t;
+/*  glob函数搜索匹配函数pattern中的参数,如/*是匹配根文件下的所有文件(不包含隐藏文件,要找到隐藏文件需要从新匹配),然后将匹配出的结果存放到pglob,即第4个参数中,第二个参数能选择匹配模式,如是否排序,或者在函数第二次调用时,是否将匹配内容追加到pglob中等,第三个参数是馋看错误信息,一般置为NULL;
+    使用glob的递归调用可以找到系统任意路径的所有文件
+ */
+ 
+ 
+#include <string.h>
+char *strdup(const char *s);
+    strdup会先用malloc()配置与参数s字符串相同的空间大小,然后将参数s字符串的内容复制到该内存地址,然后把返回.返回的地址最后可以利用free来释放
+    
+ssize_t pread(int fildes, void *buf, size_t nbyte, off_t offset);
+    和read差不多,不过是从offset这个偏置的位置开始读文件,而不是从文件指针位置
+```   
+
+###**3.3 菜单发送模块**
+    
+    ./src/server/thr_list.h     
+    ./src/server/thr_list.c 
+    把通过媒体资源处理模块得到的菜单信息通过组播发送出去,每秒一次
+    
+```
+/* 创建菜单发送线程 */
+int thr_list_create(struct mlib_listentry_st *listp, int nr_ent)
+    把listp和nr_ent传入到线程函数中去,这里是用的全局变量的形式
+    当前的菜单信息是struct mlib_listentry_st这个结构体的,要把它转化成菜单发送的数据包struct msg_list_st
+        首先根据listp确定struct msg_list_st菜单发送数据包的大小.然后malloc内存
+        然后把菜单项拷过去
+    死循环发送菜单包  间隔1s
+```
+
+###**3.4 菜单发送模块**
+    
+    给每个频道创建一个子线程发送各自频道的数据
+    
+```
+int thr_channel_create(struct mlib_listentry_st *ptr)
+    创建一个线程函数
+    static void *thr_channel_func(void *ptr)
+        通过len = mlib_readchn(ent->id, sbufp->data, datasize);来读取流媒体内容,发送出去
+
+```
+####**新遇到的函数或用法**
+```
+#include <sched.h> 
+int sched_yield(void);
+当线程调用这个函数时,会让主动出CPU使用权,让其他线程得到执行
+```
+
+##**(四) 程序的主体**
+    主要的业务流程
+
+```
+int serversd;   //socket文件描述符,全局的
+struct sockaddr_in sndaddr; //组播地址
+
+//发送端的各种默认配置,都在server_conf.h以及proto.h中定义,
+struct server_conf_st server_conf = {   
+    .rcvport = DEFAULT_RCVPORT, //端口
+    .mgroup = DEFAULT_MGROUP,   //组播ip
+    .media_dir = DEFAULT_MEDIADIR,  //媒体目录
+    .ifname = DEFAULT_IF,   //网卡名'eth0'
+    .runmode = run_daemon   //守护进程
+};
+
+```
+
+    主要的业务流程
+    
+    1. 首先是设置日志文件
+    2. 读取命令行参数,修改相应的server_conf的值
+    3. 是否变成守护进程
+    4. socket环境初始化,创建socket文件,UPD,组播地址,端口号,端口可复用,
+    5. 获取加载媒体资源,得到菜单列表, mlib_getchnlist
+    6. 创建发送菜单的线程
+    7. 循环创建发送各个频道数据的线程
+    8. 主线程暂定,由各个线程向组播地址发送数据,等待信号终止程序
+
+####**新遇到的函数或用法**    
+    
+    守护进程需要设置信号捕捉函数,以便结束进程是不会丢失文件或数据
+    
+```
+//系统提供的日志记录接口,相应日志记录到系统的日志文件中去
+#include <syslog.h> 
+void openlog(const char *ident, int option, int facility);  //程序名称,打印日志是需要携带的信息,程序的类型
+void syslog(int priority, const char *format, ...); //日志的级别,(字符串,参数)====>printf
+void closelog(void); //关闭
+
+
+#include <unistd.h>
+
+int getopt(int argc, char * const argv[],
+           const char *optstring);
+extern char *optarg;
+
+解析命令行的参数
+
+```
+
+##**(四) 总结**
+    
+        在项目规划就需要进行模块的划分,数据结构的设计.
+        在开始写代码的时候,不要过早的陷入细节,应该先把框架搭起来,模块的功能划分清楚,函数的封装以及低耦合行;然后在进行模块的编写,并且在每个模块完成之后需要进行单元测试,以便提早发现问题,解决问题,避免后期直接合并的时候,程序调BUG的难度增加.
+        两台电脑进行网络通信的时候,需要注意网络字节序,还有数据包结构体的内存对齐问题,解决方法是单字节的堆积是不会有内存对齐问题的,或者双方规定好内存对齐的方式.
+        还有就是在进行这种流媒体文件实时播放传输时,需要注意解析软件解析的速率问题,应该在发送的时候就需要限定速率,并且在接受的时候最好先缓存一部分内容,以便对应网络的颠簸造成的收包速率不稳定,而导致播放质量差,卡顿等现象.
+        在程序运行期间,日志的记录是很有必要的,对帮助了解程序的运行状态很有帮助,应合理使用,并且也要划分好日志的级别,以便在程序出现问题是快速定位问题点.
+        在编写程序过程中,应尽量少的直接使用常量赋值,对于有意义的常量应该使用宏,或者枚举还实现,提高程序的可读性
+        在进行模块编写的时候,属于模块内部调用的函数或者全局变量是应添加static关键字,只要把给其他模块调用的API提供出来就可.
+        注意内存管理,如果malloc出来的内存使用完毕后,马上free,避免内存泄露
